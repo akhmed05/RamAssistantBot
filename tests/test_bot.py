@@ -31,7 +31,8 @@ def fake_message(text='Вопрос', prompt=None, bot=True):
         text=prompt, from_user=SimpleNamespace(is_bot=bot, id=123456789),
     )
     return SimpleNamespace(
-        text=text, reply_to_message=reply, answer=AsyncMock(),
+        message_id=1, chat=SimpleNamespace(id=1, type="private"),
+        from_user=SimpleNamespace(id=1), text=text, reply_to_message=reply, answer=AsyncMock(),
         reply=AsyncMock(), reply_document=AsyncMock(),
     )
 
@@ -39,6 +40,18 @@ def fake_message(text='Вопрос', prompt=None, bot=True):
 class NoNetwork:
     def setUp(self):
         super().setUp()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.store = main.Store(Path(directory.name) / "ram.sqlite3")
+        config_patch = patch.dict(os.environ, {"RAM_OWNER_IDS": "1"})
+        config_patch.start()
+        self.addCleanup(config_patch.stop)
+        store_patch = patch.object(main, "_store", self.store)
+        store_patch.start()
+        self.addCleanup(store_patch.stop)
+        model_patch = patch.object(main, "OPENAI_MODEL", "offline-model")
+        model_patch.start()
+        self.addCleanup(model_patch.stop)
         for target in ('socket.socket.connect', 'socket.getaddrinfo'):
             guard = patch(target, side_effect=AssertionError('Network forbidden in tests'))
             guard.start()
@@ -130,7 +143,7 @@ class HandlerTests(NoNetwork, unittest.IsolatedAsyncioTestCase):
         await main.send_welcome(message)
         keyboard = message.answer.call_args.kwargs['reply_markup'].to_python()['keyboard']
         self.assertEqual([button['text'] for row in keyboard for button in row], [
-            '📹 YouTube-саммари', '💬 Задать вопрос AI', '📊 Отправить заявку', '📎 Получить PDF',
+            '📹 YouTube-саммари', '💬 Задать вопрос AI', '📊 Отправить заявку', '📎 Получить PDF', '🤖 RAM AI',
         ])
 
     async def test_prompts_request_a_reply(self):
@@ -209,6 +222,14 @@ class HandlerTests(NoNetwork, unittest.IsolatedAsyncioTestCase):
                 await task
         message.reply.assert_awaited_once_with('✅ Заявка отправлена!')
 
+    async def test_repeat_form_is_not_sent_twice(self):
+        message = fake_message('Имя / 123 / текст')
+        with patch.object(main, 'handle_google_form_submission', return_value=True) as submit:
+            await main.google_form_handler(message)
+            await main.google_form_handler(message)
+        submit.assert_called_once()
+        self.assertIn('google_form', self.store.journal(1, 'legacy'))
+
     async def test_failed_form_response(self):
         message = fake_message('invalid')
         with patch.object(main, 'handle_google_form_submission', return_value=False):
@@ -217,7 +238,7 @@ class HandlerTests(NoNetwork, unittest.IsolatedAsyncioTestCase):
 
     async def test_dispatcher_routes_actual_updates_without_telegram(self):
         dp = main.create_dispatcher(DUMMY_TOKEN)
-        self.assertEqual(len(dp.message_handlers.handlers), 8)
+        self.assertEqual(len(dp.message_handlers.handlers), 11)
         with patch.object(types.Message, 'answer', new_callable=AsyncMock) as answer, \
              patch.object(types.Message, 'reply', new_callable=AsyncMock) as reply, \
              patch.object(types.Message, 'reply_document', new_callable=AsyncMock) as document, \
@@ -276,6 +297,8 @@ class OpenAITests(NoNetwork, unittest.IsolatedAsyncioTestCase):
             clients.append(client)
             return client
         message = fake_message('Тестовый вопрос')
+        self.request_id = getattr(self, 'request_id', 0) + 1
+        message.message_id = self.request_id
         with patch.object(main, 'OPENAI_API_KEY', DUMMY_KEY), \
              patch.object(main, 'AsyncOpenAI', side_effect=factory):
             await main.ask_ai_handler(message)
@@ -284,10 +307,46 @@ class OpenAITests(NoNetwork, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.url.path, '/v1/chat/completions')
         self.assertEqual(request.headers['authorization'], 'Bearer ' + DUMMY_KEY)
         self.assertEqual(json.loads(request.content), {
-            'model': 'gpt-4', 'messages': [{'role': 'user', 'content': 'Тестовый вопрос'}],
+            'model': 'offline-model', 'max_tokens': 800, 'messages': [{'role': 'user', 'content': 'Тестовый вопрос'}],
         })
         self.assertTrue(clients[0].is_closed())
         return message
+
+    async def test_404_explains_config_without_fallback_or_secret_leak(self):
+        with self.assertLogs(main.logger, level='WARNING') as logs:
+            message = await self.run_completion(status=404)
+        self.assertIn('OPENAI_MODEL', message.reply.call_args.args[0])
+        self.assertIn('404', message.reply.call_args.args[0])
+        self.assertNotIn(DUMMY_KEY, ''.join(logs.output))
+        self.assertIn('api_404', self.store.journal(1, 'ai'))
+
+    async def test_model_is_required_and_no_client_is_created(self):
+        message = fake_message()
+        with patch.object(main, 'OPENAI_API_KEY', DUMMY_KEY), \
+             patch.object(main, 'OPENAI_MODEL', ''), patch.object(main, 'AsyncOpenAI') as client:
+            await main.ask_ai_handler(message)
+        client.assert_not_called()
+        self.assertIn('OPENAI_MODEL', message.reply.call_args.args[0])
+
+    async def test_repeat_ai_request_does_not_spend_twice(self):
+        message = await self.run_completion()
+        with patch.object(main, 'AsyncOpenAI') as client:
+            await main.ask_ai_handler(message)
+        client.assert_not_called()
+        self.assertIn('заблокировано', message.reply.call_args.args[0])
+
+    async def test_ai_daily_limit_blocks_client_and_unauthorized_access(self):
+        message = fake_message()
+        with patch.dict(os.environ, {'RAM_AI_DAILY_REQUESTS': '0'}), \
+             patch.object(main, 'OPENAI_API_KEY', DUMMY_KEY), patch.object(main, 'AsyncOpenAI') as client:
+            await main.ask_ai_handler(message)
+        client.assert_not_called()
+        self.assertIn('лимит', message.reply.call_args.args[0])
+        message.from_user.id = 99
+        with patch.object(main, 'AsyncOpenAI') as client:
+            await main.ask_ai_handler(message)
+        client.assert_not_called()
+        self.assertIn('Доступ закрыт', message.reply.call_args.args[0])
 
     async def test_real_sdk_constructor_is_compatible_with_httpx(self):
         # Construction/cleanup only; the network guard also covers this client.
