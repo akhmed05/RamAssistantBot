@@ -29,3 +29,9 @@ dist/
 .idea/
 .vscode/
 .DS_Store
+
+# Local business state (Railway volume in production)
+data/
+*.sqlite3
+*.sqlite3-*
+work/
